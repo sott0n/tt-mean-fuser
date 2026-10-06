@@ -9,7 +9,7 @@ import torch
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from models.experimental.meanfuser.tt.ttnn_meanfuser import TtnnMeanFuser
+from meanfuser.tt.ttnn_meanfuser import TtnnMeanFuser
 
 TRAJ_PCC = 0.9999
 # Waypoints reach ~20 m at 4 s; bf16 activations leave errors of ~0.1 m at the far end.

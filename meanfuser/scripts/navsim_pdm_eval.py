@@ -64,7 +64,7 @@ def _token_generator(token: str) -> torch.Generator:
 def infer(cfg, args) -> None:
     from hydra.utils import instantiate
 
-    from models.experimental.meanfuser.reference.model import load_model
+    from meanfuser.reference.model import load_model
     from navsim.common.dataclasses import SensorConfig
     from navsim.common.dataloader import SceneLoader
 
@@ -92,7 +92,7 @@ def infer(cfg, args) -> None:
     if "ttnn" in args.backends:
         import ttnn
 
-        from models.experimental.meanfuser.tt.ttnn_meanfuser import TtnnMeanFuser
+        from meanfuser.tt.ttnn_meanfuser import TtnnMeanFuser
 
         device = ttnn.open_device(device_id=0, l1_small_size=32768, trace_region_size=64 << 20)
         tt = TtnnMeanFuser(ref, device, batch_size=1)

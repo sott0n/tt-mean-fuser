@@ -30,7 +30,7 @@ import ttnn
 from models.experimental.diffusion_drive.tt.common import fold_bn
 from models.experimental.diffusion_drive.tt.ttnn_gpt_fusion import TtnnFuseFeatures
 from models.experimental.diffusion_drive.tt.ttnn_resnet34 import prep_conv_weights
-from models.experimental.meanfuser.reference.model import (
+from meanfuser.reference.model import (
     ACTION_DIM_DELTA,
     HORIZON,
     MeanFuserModel,

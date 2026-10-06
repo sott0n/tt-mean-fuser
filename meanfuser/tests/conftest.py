@@ -31,7 +31,7 @@ def reference_model():
     gmn = os.environ.get("MF_GMN_MEAN_PATH", str(_DATA_DIR / "gmn_center_points.pt"))
     if not Path(gmn).exists():
         pytest.skip(f"GMN center points not found at {gmn} (set MF_GMN_MEAN_PATH)")
-    from models.experimental.meanfuser.reference.model import load_model
+    from meanfuser.reference.model import load_model
 
     return load_model(path, gaussian_mean_path=gmn)
 
