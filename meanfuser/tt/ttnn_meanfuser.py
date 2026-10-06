@@ -38,6 +38,12 @@ from models.experimental.meanfuser.reference.model import (
 )
 
 
+# The camera is uploaded L1 height-sharded with RGB padded to 8 channels (16 B rows); from a
+# DRAM-interleaved 3-channel tensor the stem conv spends ~0.45 ms resharding its input.
+CAMERA_CHANNELS = 8
+CAMERA_CORES = 64
+
+
 def _tile(t: torch.Tensor, device, dtype=ttnn.bfloat16) -> ttnn.Tensor:
     return ttnn.from_torch(t.detach().contiguous(), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
 
@@ -74,35 +80,50 @@ def _bilinear_matrix(n_in: int, n_out: int) -> torch.Tensor:
 
 
 class _Attention:
-    """nn.MultiheadAttention (batch_first, no mask) with explicit q·kᵀ / softmax / ·v."""
+    """nn.MultiheadAttention (batch_first, no mask) on SDPA.
+
+    head_dim is 16, below the SDPA minimum, so every head is zero-padded to 32 in the Q/K/V
+    projections and the matching out_proj rows. The padded lanes add 0 to q·k and produce 0
+    outputs that out_proj ignores; the softmax scale stays 1/sqrt(16).
+    """
+
+    PAD_HEAD_DIM = 32
 
     def __init__(self, mha: nn.MultiheadAttention, device) -> None:
         E = mha.embed_dim
-        self._nh = mha.num_heads
-        self._hd = E // self._nh
-        self._E = E
+        nh, hd, hp = mha.num_heads, E // mha.num_heads, self.PAD_HEAD_DIM
+        self._nh = nh
         W, b = mha.in_proj_weight.detach(), mha.in_proj_bias.detach()
-        self._wq, self._bq = _tile(W[:E].T, device), _tile(b[:E].reshape(1, -1), device)
-        self._wk, self._bk = _tile(W[E : 2 * E].T, device), _tile(b[E : 2 * E].reshape(1, -1), device)
-        self._wv, self._bv = _tile(W[2 * E :].T, device), _tile(b[2 * E :].reshape(1, -1), device)
-        self._wo, self._bo = _tile(mha.out_proj.weight.T, device), _tile(mha.out_proj.bias.reshape(1, -1), device)
-        self._scale = 1.0 / math.sqrt(self._hd)
+
+        def pad_heads(w, bias):
+            # (E_out, E_in) rows grouped by head -> (nh*hp, E_in) with zero rows per head.
+            wp = F.pad(w.reshape(nh, hd, -1), (0, 0, 0, hp - hd)).reshape(nh * hp, -1)
+            bp = F.pad(bias.reshape(nh, hd), (0, hp - hd)).reshape(1, -1)
+            return wp, bp
+
+        wq, bq = pad_heads(W[:E], b[:E])
+        wk, bk = pad_heads(W[E : 2 * E], b[E : 2 * E])
+        wv, bv = pad_heads(W[2 * E :], b[2 * E :])
+        self._wq, self._bq = _tile(wq.T, device), _tile(bq, device)
+        self._wk, self._bk = _tile(wk.T, device), _tile(bk, device)
+        self._wv, self._bv = _tile(wv.T, device), _tile(bv, device)
+        wo = F.pad(mha.out_proj.weight.detach().reshape(E, nh, hd), (0, hp - hd)).reshape(E, nh * hp)
+        self._wo, self._bo = _tile(wo.T, device), _tile(mha.out_proj.bias.reshape(1, -1), device)
+        self._scale = 1.0 / math.sqrt(hd)
+
+    def _heads(self, x: ttnn.Tensor, B: int, S: int) -> ttnn.Tensor:
+        return ttnn.permute(ttnn.reshape(x, (B, S, self._nh, self.PAD_HEAD_DIM)), (0, 2, 1, 3))
 
     def project_kv(self, mem: ttnn.Tensor, B: int, S: int):
-        """mem (B, S, E) -> kᵀ (B, nh, hd, S), v (B, nh, S, hd)."""
-        k = ttnn.reshape(ttnn.linear(mem, self._wk, bias=self._bk), (B, S, self._nh, self._hd))
-        v = ttnn.reshape(ttnn.linear(mem, self._wv, bias=self._bv), (B, S, self._nh, self._hd))
-        return ttnn.permute(k, (0, 2, 3, 1)), ttnn.permute(v, (0, 2, 1, 3))
+        """mem (B, S, E) -> padded k, v heads (B, nh, S, 32)."""
+        k = self._heads(ttnn.linear(mem, self._wk, bias=self._bk), B, S)
+        v = self._heads(ttnn.linear(mem, self._wv, bias=self._bv), B, S)
+        return k, v
 
     def __call__(self, x: ttnn.Tensor, B: int, Sq: int, kv) -> ttnn.Tensor:
-        k_t, v = kv
-        q = ttnn.linear(x, self._wq, bias=self._bq)
-        q = ttnn.permute(ttnn.reshape(q, (B, Sq, self._nh, self._hd)), (0, 2, 1, 3))  # (B, nh, Sq, hd)
-        att = ttnn.multiply(ttnn.matmul(q, k_t), self._scale)
-        att = ttnn.softmax(att, dim=-1, numeric_stable=True)
-        o = ttnn.matmul(att, v)  # (B, nh, Sq, hd)
-        o = ttnn.reshape(ttnn.permute(o, (0, 2, 1, 3)), (B, Sq, self._E))
-        return ttnn.linear(o, self._wo, bias=self._bo)
+        q = self._heads(ttnn.linear(x, self._wq, bias=self._bq), B, Sq)
+        o = ttnn.transformer.scaled_dot_product_attention(q, *kv, is_causal=False, scale=self._scale)
+        return ttnn.linear(ttnn.transformer.concatenate_heads(o), self._wo, bias=self._bo)
 
 
 class _DecoderLayer:
@@ -157,34 +178,52 @@ class _Decoder:
 class _Conv:
     """Plain / BN-folded Conv2d with device-cached weights. NHWC-flat (1,1,B*H*W,C) in and out.
 
-    HiFi4 with fp32 accumulation: at the default fidelity the error compounds through the
-    ResNet-34 stages (deepest LiDAR feature PCC ~0.97, trajectory off by ~0.7 m).
+    HiFi2 with fp32 accumulation: with the default conv compute config the error compounds through
+    the ResNet-34 stages (deepest LiDAR feature PCC ~0.97, trajectory off by ~0.7 m). HiFi2 matches
+    HiFi4 on navtest.
     """
 
-    def __init__(self, conv: nn.Conv2d, bn: Optional[nn.BatchNorm2d] = None, stride: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        conv: nn.Conv2d,
+        bn: Optional[nn.BatchNorm2d] = None,
+        stride: Optional[int] = None,
+        pad_in_channels: Optional[int] = None,
+    ) -> None:
         if bn is not None:
             w, b = fold_bn(conv, bn)
         else:
             w = conv.weight.detach()
             b = conv.bias.detach() if conv.bias is not None else torch.zeros(conv.out_channels)
-        self._w, self._b = prep_conv_weights(w.to(torch.bfloat16), b.to(torch.bfloat16))
         self.cin, self.cout = conv.in_channels, conv.out_channels
+        if pad_in_channels is not None:
+            w = F.pad(w, (0, 0, 0, 0, 0, pad_in_channels - self.cin))
+            self.cin = pad_in_channels
+        self._w, self._b = prep_conv_weights(w.to(torch.bfloat16), b.to(torch.bfloat16))
         self._k = int(conv.kernel_size[0])
         self._s = int(stride if stride is not None else conv.stride[0])
         self._p = int(conv.padding[0])
 
-    def __call__(self, device, x, B: int, H: int, W: int, relu: bool = True):
+    def __call__(self, device, x, B: int, H: int, W: int, relu: bool = True, sharded_out: bool = False):
+        if sharded_out:
+            # Keep a ResNet stage in L1. Otherwise conv2d runs DRAM-sliced and wraps every conv
+            # in an interleaved<->sharded conversion.
+            # Height sharding spreads small outputs over too few cores (e.g. 8 for 8×32 px).
+            out_px = B * ((H + 2 * self._p - self._k) // self._s + 1) * ((W + 2 * self._p - self._k) // self._s + 1)
+            layout = ttnn.TensorMemoryLayout.HEIGHT_SHARDED if out_px >= 2048 else ttnn.TensorMemoryLayout.BLOCK_SHARDED
+        else:
+            layout = None
         conv_config = ttnn.Conv2dConfig(
             weights_dtype=ttnn.bfloat16,
             deallocate_activation=False,
             reallocate_halo_output=True,
-            reshard_if_not_optimal=False,
-            shard_layout=None,
+            reshard_if_not_optimal=sharded_out,
+            shard_layout=layout,
             activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU) if relu else None,
         )
         compute_config = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_fidelity=ttnn.MathFidelity.HiFi2,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
             math_approx_mode=False,
@@ -205,10 +244,11 @@ class _Conv:
             input_width=W,
             conv_config=conv_config,
             compute_config=compute_config,
+            slice_config=ttnn.Conv2dL1FullSliceConfig if sharded_out else None,
             return_weights_and_bias=True,
             return_output_dim=True,
         )
-        return _interleaved_tile(out), Ho, Wo
+        return (out if sharded_out else _interleaved_tile(out)), Ho, Wo
 
 
 class _BasicBlock:
@@ -221,11 +261,65 @@ class _BasicBlock:
         self._ds = _Conv(block.downsample[0], block.downsample[1]) if block.downsample is not None else None
 
     def __call__(self, x, shape):
+        """Output stays in the conv's sharded L1 layout; the stage caller interleaves once at the end."""
         B, H, W, _ = shape
-        y, H1, W1 = self._c1(self._d, x, B, H, W)
-        y, H2, W2 = self._c2(self._d, y, B, H1, W1, relu=False)
-        sc = self._ds(self._d, x, B, H, W, relu=False)[0] if self._ds is not None else x
-        return ttnn.relu(ttnn.add(y, sc)), (B, H2, W2, self._c2.cout)
+        y, H1, W1 = self._c1(self._d, x, B, H, W, sharded_out=True)
+        y, H2, W2 = self._c2(self._d, y, B, H1, W1, relu=False, sharded_out=True)
+        sc = self._ds(self._d, x, B, H, W, relu=False, sharded_out=True)[0] if self._ds is not None else x
+        if sc.memory_config() != y.memory_config():
+            sc = ttnn.to_memory_config(sc, y.memory_config())
+        y = ttnn.add_(y, sc, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU)])
+        return y, (B, H2, W2, self._c2.cout)
+
+
+def _run_stage(blocks: List[_BasicBlock], x, shape):
+    for blk in blocks:
+        x, shape = blk(x, shape)
+    return _interleaved_tile(x), shape
+
+
+class _SdpaSelfAttn:
+    """GPT SelfAttention as fused QKV + head split + SDPA. Needs head_dim >= 32."""
+
+    def __init__(self, sa, device) -> None:
+        self._nh = sa.n_head
+        w = torch.cat([sa.query.weight, sa.key.weight, sa.value.weight], 0).T
+        b = torch.cat([sa.query.bias, sa.key.bias, sa.value.bias]).reshape(1, -1)
+        self._wqkv, self._bqkv = _tile(w, device), _tile(b, device)
+        self._wo, self._bo = _linear_params(sa.proj, device)
+
+    def __call__(self, x, B, T, C):
+        qkv = ttnn.linear(x, self._wqkv, bias=self._bqkv)
+        q, k, v = ttnn.transformer.split_query_key_value_and_split_heads(qkv, num_heads=self._nh, transpose_key=False)
+        o = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=False)
+        return ttnn.linear(ttnn.transformer.concatenate_heads(o), self._wo, bias=self._bo)
+
+
+class _FuseFeatures(TtnnFuseFeatures):
+    """DiffusionDrive GPT fusion with two changes:
+
+    * The avg-pool input is height-sharded over many cores first. Given an interleaved input,
+      avg_pool2d shards it onto as few as 4 cores; on the 64×64 LiDAR map that costs ~0.9 ms
+      instead of ~0.03 ms.
+    * Scales with head_dim >= 32 use SDPA; the per-head reshape/permute path is 3-5x slower.
+    """
+
+    def __init__(self, ref_backbone, device) -> None:
+        super().__init__(ref_backbone, device)
+        for gpt_ref, gpt in zip(ref_backbone.transformers, self._gpt):
+            for blk_ref, blk in zip(gpt_ref.blocks, gpt._blocks):
+                if blk_ref.attn.key.out_features // blk_ref.attn.n_head >= 32:
+                    blk._attn = _SdpaSelfAttn(blk_ref.attn, device)
+
+    def _avg_pool(self, x_rm, B, H, W, C, vert, horz):
+        n = min(B * vert, self._d.compute_with_storage_grid_size().x * self._d.compute_with_storage_grid_size().y)
+        while (B * vert) % n:
+            n -= 1
+        grid = ttnn.num_cores_to_corerangeset(n, self._d.compute_with_storage_grid_size(), row_wise=True)
+        mc = ttnn.create_sharded_memory_config(
+            (B * H * W // n, C), grid, ttnn.ShardStrategy.HEIGHT, use_height_and_width_as_shard_shape=True
+        )
+        return super()._avg_pool(ttnn.to_memory_config(x_rm, mc), B, H, W, C, vert, horz)
 
 
 class TtnnMeanFuserBackbone:
@@ -235,13 +329,13 @@ class TtnnMeanFuserBackbone:
         self._d = device
         self._B = batch_size
         img = ref.image_encoder
-        self._img_stem = _Conv(img.conv1, img.bn1)
+        self._img_stem = _Conv(img.conv1, img.bn1, pad_in_channels=CAMERA_CHANNELS)
         self._img_stages: List[List[_BasicBlock]] = []
         self._lid_stages: List[List[_BasicBlock]] = []
         for i in range(4):
             self._img_stages.append([_BasicBlock(b, device) for b in getattr(img, f"layer{i + 1}")])
             self._lid_stages.append([_BasicBlock(b, device) for b in getattr(ref.lidar_encoder, f"layer{i + 1}")])
-        self._fusion = TtnnFuseFeatures(ref, device)
+        self._fusion = _FuseFeatures(ref, device)
 
         self._c5 = _Conv(ref.c5_conv)
         self._up5 = _Conv(ref.up_conv5)
@@ -260,15 +354,12 @@ class TtnnMeanFuserBackbone:
         x = x.expand(self._B, -1, -1, -1)
         B, C, H, W = x.shape
         t = _tile(x.permute(0, 2, 3, 1).reshape(1, 1, B * H * W, C), self._d)
-        shape = (B, H, W, C)
-        for blk in self._lid_stages[0]:
-            t, shape = blk(t, shape)
-        return t, shape
+        return _run_stage(self._lid_stages[0], t, (B, H, W, C))
 
     def _stem(self, x, B: int, H: int, W: int):
-        out, Ho, Wo = self._img_stem(self._d, x, B, H, W)
+        out, Ho, Wo = self._img_stem(self._d, x, B, H, W, sharded_out=True)
         out = ttnn.max_pool2d(
-            ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT),
+            out,
             batch_size=B,
             input_h=Ho,
             input_w=Wo,
@@ -290,11 +381,9 @@ class TtnnMeanFuserBackbone:
         img, img_shape = self._stem(camera, B, H, W)
         lid, lid_shape = self._lid0, self._lid0_shape
         for i in range(4):
-            for blk in self._img_stages[i]:
-                img, img_shape = blk(img, img_shape)
+            img, img_shape = _run_stage(self._img_stages[i], img, img_shape)
             if i > 0:
-                for blk in self._lid_stages[i]:
-                    lid, lid_shape = blk(lid, lid_shape)
+                lid, lid_shape = _run_stage(self._lid_stages[i], lid, lid_shape)
             img, img_shape, lid, lid_shape = self._fusion.forward_dev(img, img_shape, lid, lid_shape, i)
         ttnn.deallocate(img)
 
@@ -426,11 +515,29 @@ class TtnnMeanFuser:
         return self._arm(proposals, context), proposals
 
     # -- host boundary -----------------------------------------------------
+    def _camera_memory_config(self, n_rows: int):
+        grid = ttnn.num_cores_to_corerangeset(CAMERA_CORES, self._d.compute_with_storage_grid_size(), row_wise=True)
+        return ttnn.create_sharded_memory_config(
+            (n_rows // CAMERA_CORES, CAMERA_CHANNELS),
+            grid,
+            ttnn.ShardStrategy.HEIGHT,
+            use_height_and_width_as_shard_shape=True,
+        )
+
     def prepare_inputs(self, camera: torch.Tensor, status: torch.Tensor, noise: torch.Tensor, device=None):
         B, C, H, W = camera.shape
         assert B == self._B
-        cam = camera.permute(0, 2, 3, 1).reshape(1, 1, B * H * W, C)
-        cam_t = ttnn.from_torch(cam, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+        # Writing into a reused zero-padded bf16 buffer is ~10x faster than permute + pad + cast.
+        if getattr(self, "_cam_buf", None) is None or self._cam_buf.shape[2] != B * H * W:
+            self._cam_buf = torch.zeros(1, 1, B * H * W, CAMERA_CHANNELS, dtype=torch.bfloat16)
+        self._cam_buf[0, 0, :, :C].copy_(camera.permute(0, 2, 3, 1).reshape(B * H * W, C))
+        cam_t = ttnn.from_torch(
+            self._cam_buf,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            memory_config=self._camera_memory_config(B * H * W) if device is not None else None,
+        )
         st_t = ttnn.from_torch(
             status.reshape(B, 1, -1).float(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
         )
