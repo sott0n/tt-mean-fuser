@@ -17,8 +17,8 @@ _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 @pytest.fixture(scope="session")
 def device():
-    # conv2d needs l1_small; the trace test needs a trace region.
-    dev = ttnn.open_device(device_id=0, l1_small_size=32768, trace_region_size=64 << 20)
+    # conv2d needs l1_small; the trace tests need a trace region and a second command queue.
+    dev = ttnn.open_device(device_id=0, l1_small_size=32768, trace_region_size=64 << 20, num_command_queues=2)
     yield dev
     ttnn.close_device(dev)
 

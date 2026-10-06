@@ -66,3 +66,18 @@ def test_trace_matches_reference(device, reference_model, make_inputs):
             assert (stale - actual).abs().max() > 4 * TRAJ_MAX_ABS_ERR_M, "trace replay ignored the new inputs"
     finally:
         tt.release_trace()
+
+
+@pytest.mark.timeout(600)
+def test_trace_2cq_matches_reference(device, reference_model, make_inputs):
+    """Pipelined 2CQ replay: every yielded result must belong to its own frame, in order."""
+    tt = TtnnMeanFuser(reference_model, device, batch_size=1)
+    tt.capture_trace_2cq(*make_inputs(seed=100))
+    frames = [make_inputs(seed=s) for s in (1, 2, 3, 4, 5)]
+    try:
+        results = list(tt.run_trace_2cq(frames))
+        assert len(results) == len(frames)
+        for frame, result in zip(frames, results):
+            _check_trajectory(_reference(reference_model, *frame)["trajectory"], result["trajectory"])
+    finally:
+        tt.release_trace()

@@ -20,7 +20,7 @@ Reuses the DiffusionDrive ResNet-34 blocks and GPT fusion. MeanFuser-specific ch
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -672,15 +672,80 @@ class TtnnMeanFuser:
         ttnn.execute_trace(self._d, self._trace_id, cq_id=0, blocking=False)
         return self.postprocess(*self._trace_out)
 
+    # -- trace with two command queues ---------------------------------------
+    # CQ1 uploads the next camera frame while CQ0 runs the current trace. The camera input is
+    # double-buffered with one trace per buffer, so CQ1 writes straight into the L1 buffer the
+    # running trace does not read; staging through DRAM costs ~0.84 ms of device time per frame.
+    # The device must be opened with num_command_queues=2.
+    CQ_OPS, CQ_INPUT = 0, 1
+
+    def capture_trace_2cq(self, camera: torch.Tensor, status: torch.Tensor, noise: torch.Tensor) -> None:
+        (cam_a, st_t, nz_t), hw = self.prepare_inputs(camera, status, noise, self._d)
+        cam_b = self.prepare_inputs(camera, status, noise, self._d)[0][0]
+        for cam in (cam_a, cam_b):
+            for _ in range(2):  # conv2d prepares its weights on the first call
+                warm = self.forward_dev(cam, st_t, nz_t, *hw)
+        # Results are copied into buffers allocated before either capture. A trace's own output
+        # tensors would be allocated after the other trace was captured and could alias its
+        # intermediates, so replaying trace A could overwrite trace B's last result.
+        outs = [tuple(ttnn.clone(t) for t in warm) for _ in range(2)]
+        for t, o in zip(warm, outs[0]):
+            ttnn.copy(t, o)
+        ttnn.synchronize_device(self._d)
+        self._traces_2cq = []
+        for cam, out in zip((cam_a, cam_b), outs):
+            tid = ttnn.begin_trace_capture(self._d, cq_id=self.CQ_OPS)
+            res = self.forward_dev(cam, st_t, nz_t, *hw)
+            for t, o in zip(res, out):
+                ttnn.copy(t, o)
+            for t in res:
+                ttnn.deallocate(t)
+            ttnn.end_trace_capture(self._d, tid, cq_id=self.CQ_OPS)
+            self._traces_2cq.append((tid, cam, out))
+        self._inputs_2cq = (st_t, nz_t)
+        done = ttnn.record_event(self._d, self.CQ_OPS)
+        self._done_2cq = [done, done]
+
+    def run_trace_2cq(self, frames: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> Iterator[Dict]:
+        """Yields results in input order, one frame behind: frame k-1's output is read on CQ1 while
+        trace k runs, and host prep + H2D of frame k overlap trace k-1."""
+        st_t, nz_t = self._inputs_2cq
+        pending, k = None, 0
+        for camera, status, noise in frames:
+            b = k % 2
+            tid, cam_t, out = self._traces_2cq[b]
+            cam_h, st_h, nz_h = self.prepare_inputs(camera, status, noise)[0]
+            ttnn.wait_for_event(self.CQ_INPUT, self._done_2cq[b])  # trace k-2 finished reading cam_t
+            ttnn.copy_host_to_device_tensor(cam_h, cam_t, cq_id=self.CQ_INPUT)
+            write_event = ttnn.record_event(self._d, self.CQ_INPUT)
+            # status/noise are read mid-trace; writing them on CQ0 orders them after trace k-1.
+            ttnn.copy_host_to_device_tensor(st_h, st_t, cq_id=self.CQ_OPS)
+            ttnn.copy_host_to_device_tensor(nz_h, nz_t, cq_id=self.CQ_OPS)
+            ttnn.wait_for_event(self.CQ_OPS, write_event)
+            ttnn.execute_trace(self._d, tid, cq_id=self.CQ_OPS, blocking=False)
+            self._done_2cq[b] = ttnn.record_event(self._d, self.CQ_OPS)
+            if pending is not None:
+                # Each trace owns its outputs, so trace k cannot overwrite frame k-1's results.
+                ttnn.wait_for_event(self.CQ_INPUT, self._done_2cq[1 - b])
+                yield self.postprocess(*pending, queue_id=self.CQ_INPUT)
+            pending, k = out, k + 1
+        if pending is not None:
+            ttnn.wait_for_event(self.CQ_INPUT, self._done_2cq[(k - 1) % 2])
+            yield self.postprocess(*pending, queue_id=self.CQ_INPUT)
+
     def release_trace(self) -> None:
         if getattr(self, "_trace_id", None) is not None:
             ttnn.release_trace(self._d, self._trace_id)
             self._trace_id = None
+        for tid, _, _ in getattr(self, "_traces_2cq", []):
+            ttnn.release_trace(self._d, tid)
+        self._traces_2cq = []
 
-    def postprocess(self, diff_t, prop_t) -> Dict[str, torch.Tensor]:
+    def postprocess(self, diff_t, prop_t, queue_id: Optional[int] = None) -> Dict[str, torch.Tensor]:
         B, K = self._B, self._K
-        diff = ttnn.to_torch(diff_t).float().reshape(B, HORIZON, ACTION_DIM_DELTA)
-        props = ttnn.to_torch(prop_t).float().reshape(B, K, HORIZON, ACTION_DIM_DELTA)
+        diff = ttnn.to_torch(ttnn.from_device(diff_t, queue_id=queue_id)).float().reshape(B, HORIZON, ACTION_DIM_DELTA)
+        props = ttnn.to_torch(ttnn.from_device(prop_t, queue_id=queue_id)).float()
+        props = props.reshape(B, K, HORIZON, ACTION_DIM_DELTA)
         return {
             "trajectory": cumsum_traj(diff),
             "diff_trajectory": diff,
