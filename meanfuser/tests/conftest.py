@@ -28,14 +28,17 @@ def reference_model():
     path = os.environ.get("MF_CHECKPOINT_PATH", str(_DATA_DIR / "meanfuser_navsim.ckpt"))
     if not Path(path).exists():
         pytest.skip(f"MeanFuser checkpoint not found at {path} (set MF_CHECKPOINT_PATH)")
+    gmn = os.environ.get("MF_GMN_MEAN_PATH", str(_DATA_DIR / "gmn_center_points.pt"))
+    if not Path(gmn).exists():
+        pytest.skip(f"GMN center points not found at {gmn} (set MF_GMN_MEAN_PATH)")
     from models.experimental.meanfuser.reference.model import load_model
 
-    return load_model(path)
+    return load_model(path, gaussian_mean_path=gmn)
 
 
 @pytest.fixture
 def make_inputs(reference_model):
-    """Production-resolution inputs; GMN noise uses the checkpoint's per-mode std."""
+    """Production-resolution inputs with GMN noise sampled as in upstream inference."""
 
     def _make(seed: int, batch_size: int = 1):
         g = torch.Generator().manual_seed(seed)
@@ -44,8 +47,7 @@ def make_inputs(reference_model):
         velocity = torch.rand(batch_size, 2, generator=g) * torch.tensor([10.0, 1.0])
         accel = torch.randn(batch_size, 2, generator=g)
         status = torch.cat([command, velocity, accel], dim=1)
-        std = reference_model._meanflow_head.gaussian_std
-        noise = torch.randn(batch_size, std.shape[0], 8, 4, generator=g) * std[None, :, None, :]
+        noise = reference_model._meanflow_head.sample_noise(batch_size, generator=g)
         return camera, status, noise
 
     return _make
