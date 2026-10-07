@@ -54,8 +54,8 @@ Put these in `meanfuser/data/` (gitignored; a symlink works), or point `MF_CHECK
 
 | File | Source |
 |---|---|
-| `meanfuser_navsim.ckpt` | upstream checkpoint (PDMS 89.0), Google Drive id `16989kIYhM3wQgxjSKvRFfK9cdKZfuU2P` |
-| `gmn_center_points.pt` | `center_points` of upstream `tools/gaussian_mixed_noise/navtrain_8_mean_std.pkl` |
+| `meanfuser_navsim.ckpt` | [upstream checkpoint](https://drive.google.com/file/d/16989kIYhM3wQgxjSKvRFfK9cdKZfuU2P/view) (PDMS 89.0, Google Drive) |
+| `gmn_center_points.pt` | `center_points` of upstream [`navtrain_8_mean_std.pkl`](https://github.com/wjl2244/MeanFuser/blob/8de8ba6244834645192e318dcc437d124cfd6872/tools/gaussian_mixed_noise/navtrain_8_mean_std.pkl) |
 
 The `.pkl` is a full pickle (protocol 4); convert it once, from a source you trust:
 
