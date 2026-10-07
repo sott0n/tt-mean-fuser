@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 # ttnn reports and profiler output
 generated/
+# wheel build output
+build/
+*.egg-info/

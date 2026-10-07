@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meanfuser"
+version = "0.1.0"
+description = "MeanFuser end-to-end driving planner on Tenstorrent Blackhole (TTNN)"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# torch and ttnn are pinned by the deployment, not here: ttnn has no index release for the
+# pinned tt-metal, and torch must be the CPU build.
+dependencies = ["timm", "diffusers", "pillow", "fastapi", "uvicorn"]
+
+[tool.setuptools]
+# The model reuses tt-metal's DiffusionDrive pieces, so ship them with it. tt-metal's models/
+# tree has no __init__.py, so they install as a namespace package next to nothing else.
+packages = [
+    "meanfuser",
+    "meanfuser.reference",
+    "meanfuser.server",
+    "meanfuser.tt",
+    "models.experimental.diffusion_drive",
+    "models.experimental.diffusion_drive.reference",
+    "models.experimental.diffusion_drive.tt",
+]
+
+[tool.setuptools.package-dir]
+"models.experimental.diffusion_drive" = "third_party/tt-metal/models/experimental/diffusion_drive"

@@ -18,7 +18,9 @@ meanfuser/
   reference/model.py        PyTorch reference; matches upstream bit-exactly
   tt/ttnn_meanfuser.py      TTNN model, 1 CQ and 2 CQ trace paths
   tests/pcc/                PCC tests: eager, trace, 2 CQ trace
+  server/app.py             HTTP server, served by tt-model
   scripts/navsim_pdm_eval.py  navtest PDMS for TTNN and/or the CPU reference
+  scripts/package_tt_model.sh  stage the tt-model bundle
 third_party/tt-metal        tt-metal submodule (pinned)
 ```
 
@@ -90,6 +92,39 @@ tt.capture_trace_2cq(camera, status, noise)      # 2 CQ, highest throughput
 for out in tt.run_trace_2cq(frames):             # frames: iterable of (camera, status, noise)
     ...
 ```
+
+## Serving with tt-model
+
+`meanfuser/server/app.py` is an HTTP server for the model. [tt-model](https://github.com/tenstorrent/tt-model-manager)
+serves it as a v6 thin bundle with `kind: tt-dit-server` (uvicorn, no vLLM).
+
+```
+POST /v1/plan    {"image": <base64 PNG/JPEG, 1024x256 RGB, stitched L0/F0/R0>,
+                  "status": [command one-hot (4), velocity xy, acceleration xy], "seed": int | null}
+                 -> {"trajectory": [[x, y, heading] x 8], "timing_ms": {...}}
+GET  /v1/health, GET /v1/models
+```
+
+The bundle carries no weights. Get the two files in [Assets](#assets) from upstream, then:
+
+```bash
+MF_CHECKPOINT_PATH=/path/to/meanfuser_navsim.ckpt MF_GMN_MEAN_PATH=/path/to/gmn_center_points.pt \
+TT_VISIBLE_DEVICES=3 tt-model serve <org>/meanfuser
+```
+
+- The host needs SFPI 7.84.0 in `/opt/tenstorrent/sfpi`. ttnn wheels do not bundle SFPI.
+- The first start compiles kernels, which takes ~10 min. Later starts reuse the cache.
+- Ready when uvicorn prints "Application startup complete": the trace is captured at startup.
+
+To build the bundle from this checkout (needs a built tt-metal, `uv` and `tt-model`):
+
+```bash
+meanfuser/scripts/package_tt_model.sh <out-dir>                    # stage only
+meanfuser/scripts/package_tt_model.sh <out-dir> --push <org>/meanfuser
+```
+
+It bundles a ttnn wheel of the pinned tt-metal, since no index has one, and a `meanfuser`
+wheel that also ships tt-metal's `diffusion_drive` modules.
 
 ## navtest PDMS
 
