@@ -94,8 +94,22 @@ for out in tt.run_trace_2cq(frames):             # frames: iterable of (camera, 
 ## navtest PDMS
 
 The eval runs in a separate venv with the NAVSIM devkit (the upstream MeanFuser repo) and
-nuplan-devkit. ttnn and torch come from the tt-metal env through a `.pth` file that calls
-`site.addsitedir(<tt-metal python_env site-packages>)`.
+nuplan-devkit. It takes ttnn and torch from the tt-metal checkout in `$TT_METAL_HOME`. Build it
+once (needs `uv`):
+
+```bash
+meanfuser/scripts/setup_navsim_venv.sh <navsim-root>   # devkits + venv under <navsim-root>
+```
+
+Then, for each run, set the tt-metal side and activate the venv:
+
+```bash
+export TT_METAL_HOME=$PWD/third_party/tt-metal PYTHONPATH=$PWD
+export TT_VISIBLE_DEVICES=3 TT_MESH_GRAPH_DESC_PATH=...   # as in "Selecting one chip"
+export NAVSIM_DEVKIT_ROOT=<navsim-root>/MeanFuser OPENSCENE_DATA_ROOT=... NUPLAN_MAPS_ROOT=...
+export NUPLAN_MAP_VERSION=nuplan-maps-v1.0 NAVSIM_EXP_ROOT=... NAVSIM_CACHE_ROOT=...
+source <navsim-root>/venv/bin/activate
+```
 
 1. Download the navtest split. Only `CAM_F0`, `CAM_L0` and `CAM_R0` are needed (~45 GB after
    extraction). Also download `openscene_metadata_test` and the nuPlan maps.
@@ -103,6 +117,9 @@ nuplan-devkit. ttnn and torch come from the tt-metal env through a `.pth` file t
    `python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_metric_caching.py train_test_split=navtest cache.cache_path=$NAVSIM_CACHE_ROOT/navtest_v1_metric_cache`
 3. Run inference and scoring:
    `python meanfuser/scripts/navsim_pdm_eval.py all --out <dir>` (add `--backends ttnn` for TTNN only)
+
+   `infer` needs the device. `score` is CPU only. They can run as separate steps on the same
+   `--out`. TTNN `infer` on navtest takes ~22 ms/scene, ~4.5 min in total.
 
 Both backends use the same per-token GMN noise, so their scores differ only by numerics.
 
