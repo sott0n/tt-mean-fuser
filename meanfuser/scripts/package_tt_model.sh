@@ -5,7 +5,7 @@
 #
 # Stage MeanFuser as a tt-model v6 thin bundle (kind tt-dit-server) from this checkout.
 #
-#   meanfuser/scripts/package_tt_model.sh <out-dir> [tt-model package-thin args, e.g. --push org/name]
+#   meanfuser/scripts/package_tt_model.sh <out-dir> [org/name to push] [more package-thin args]
 #
 # Needs a built third_party/tt-metal (build_metal.sh), uv, and the tt-model CLI. The bundle
 # carries a ttnn wheel of the pinned tt-metal (no index has it) and a meanfuser wheel. It

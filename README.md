@@ -119,8 +119,8 @@ TT_VISIBLE_DEVICES=3 tt-model serve <org>/meanfuser
 To build the bundle from this checkout (needs a built tt-metal, `uv` and `tt-model`):
 
 ```bash
-meanfuser/scripts/package_tt_model.sh <out-dir>                    # stage only
-meanfuser/scripts/package_tt_model.sh <out-dir> --push <org>/meanfuser
+meanfuser/scripts/package_tt_model.sh <out-dir>                  # stage only
+meanfuser/scripts/package_tt_model.sh <out-dir> <org>/meanfuser  # stage and push
 ```
 
 It bundles a ttnn wheel of the pinned tt-metal, since no index has one, and a `meanfuser`
