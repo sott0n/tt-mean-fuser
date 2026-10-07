@@ -109,9 +109,10 @@ The bundle carries no weights. Get the two files in [Assets](#assets) from upstr
 
 ```bash
 MF_CHECKPOINT_PATH=/path/to/meanfuser_navsim.ckpt MF_GMN_MEAN_PATH=/path/to/gmn_center_points.pt \
-TT_VISIBLE_DEVICES=3 tt-model serve <org>/meanfuser
+TT_VISIBLE_DEVICES=3 tt-model serve <org>/meanfuser --port 8000
 ```
 
+- `--port` picks the port (default 20000).
 - The host needs SFPI 7.84.0 in `/opt/tenstorrent/sfpi`. ttnn wheels do not bundle SFPI.
 - The first start compiles kernels, which takes ~10 min. Later starts reuse the cache.
 - Ready when uvicorn prints "Application startup complete": the trace is captured at startup.
